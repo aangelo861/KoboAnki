@@ -1,0 +1,19 @@
+[package]
+name = "kanki"
+version = "0.1.0"
+edition = "2021"
+description = "Anki for Kobo: AnkiWeb sync, scheduling and card rendering on the device, built on Anki's own Rust core"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+anki = { path = "../vendor/anki/rslib" }
+# Bundle Mozilla's root certificates so TLS to AnkiWeb works without relying on the Kobo's system store.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
+anyhow = "1"
+anki_proto = { path = "../vendor/anki/rslib/proto" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiny_http = "0.12"
+libc = "0.2"
+tokio = { version = "1", features = ["rt"] }
+kanki_html = { path = "../kanki_html" }

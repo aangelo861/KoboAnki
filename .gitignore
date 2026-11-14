@@ -1,0 +1,23 @@
+# Build output
+target/
+target-arm/
+dist/
+__pycache__/
+*.pyc
+.DS_Store
+._*
+
+# Anki's source is fetched by scripts/fetch-anki.sh (tag 26.09.3 + patches/)
+vendor/
+
+# Private: SSH keys for the developer's Kobo, screenshots, study content, local notes
+.dev/
+CLAUDE.md
+.claude/
+
+# Other local plugins, not part of KoboAnki
+koplugin/casc.koplugin/
+koplugin/casc2.koplugin/
+koplugin/devtools/test_casc.lua
+koplugin/devtools/test_casc2.lua
+scripts/*casc*

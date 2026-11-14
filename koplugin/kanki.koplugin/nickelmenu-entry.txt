@@ -1,0 +1,1 @@
+menu_item:main:Anki:cmd_spawn:quiet:exec /bin/sh /mnt/onboard/.adds/koreader/plugins/kanki.koplugin/launch.sh

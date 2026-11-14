@@ -1,0 +1,12 @@
+[package]
+name = "kanki_devsync"
+version = "0.1.0"
+edition = "2021"
+description = "Dev-only: run Anki's sync server locally and act as a 'desktop' client, to test kanki without AnkiWeb"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[dependencies]
+anki = { path = "../../vendor/anki/rslib" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots"] }
+tokio = { version = "1", features = ["rt"] }

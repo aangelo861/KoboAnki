@@ -1,0 +1,29 @@
+diff --git a/rslib/src/card/mod.rs b/rslib/src/card/mod.rs
+index 8e1336a..365f83b 100644
+--- a/rslib/src/card/mod.rs
++++ b/rslib/src/card/mod.rs
+@@ -175,6 +175,11 @@ impl Card {
+         self.template_idx
+     }
+ 
++    /// User flag (0 = none, 1 red, 2 orange, 3 green, 4 blue, 5 pink, 6 turquoise, 7 purple).
++    pub fn flags(&self) -> u8 {
++        self.flags
++    }
++
+     pub fn queue_number(&self) -> CardQueueNumber {
+         match self.queue {
+             CardQueue::New => CardQueueNumber::New,
+diff --git a/rslib/src/lib.rs b/rslib/src/lib.rs
+index 2d6484a..a5c3a46 100644
+--- a/rslib/src/lib.rs
++++ b/rslib/src/lib.rs
+@@ -32,7 +32,7 @@ pub mod notetype;
+ pub mod ops;
+ mod preferences;
+ pub mod prelude;
+-mod progress;
++pub mod progress;
+ pub mod revlog;
+ pub mod scheduler;
+ pub mod search;

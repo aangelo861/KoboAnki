@@ -1,0 +1,17 @@
+KoboAnki - Anki for your Kobo (KOReader plugin)
+===============================================
+
+You need: a Kobo with KOReader installed, an AnkiWeb account, Wi-Fi.
+Full guide: https://github.com/aangelo861/KoboAnki#install-about-5-minutes
+
+1. Connect the Kobo with USB and tap "Connect" on the Kobo (it shows up as KOBOeReader).
+2. Copy the folder "kanki.koplugin" into  KOBOeReader/.adds/koreader/plugins/
+   (.adds is hidden: Mac Finder Cmd+Shift+.  /  Windows: View > Hidden items)
+   Updating? Replace the old kanki.koplugin folder. Your cards (in .adds/kanki) are kept.
+3. Optional, if you use NickelMenu: copy NickelMenu/kanki into  KOBOeReader/.adds/nm/
+4. Eject the Kobo. Open KOReader, then the top menu > Anki > Log in.
+
+Mac shortcut for steps 2-4, in Terminal:   bash <this folder>/install-macos.sh
+
+Licence: the plugin code is MIT. bin/kanki contains Anki's core (AGPL v3), so the binary is distributed
+under the AGPL v3 (LICENSE-AGPL-3.0.txt). Source: https://github.com/aangelo861/KoboAnki

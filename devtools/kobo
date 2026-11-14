@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""Remote control for the Kobo Libra Colour over SSH: screenshots, taps, swipes, buttons, shell, logs.
+
+Needs KOReader's SSH server running on the Kobo (KOReader > Tools > More tools > SSH server) and the
+project key in .dev/. Nothing is installed on the Kobo: screenshots read /dev/fb0, and input is
+injected by writing Linux input events to the touchscreen/button devices, exactly as the hardware
+does, so it works in KOReader and in the Kobo's own software alike.
+
+  devtools/kobo shot [out.png] [--full]   screenshot (default .dev/screens/<time>.png, 900 px tall copy)
+  devtools/kobo tap X Y                   tap at screen pixel X,Y (coordinates of a --full screenshot)
+  devtools/kobo hold X Y [SECONDS]        long-press (default 1 s)
+  devtools/kobo swipe X1 Y1 X2 Y2 [MS]    swipe (default 300 ms)
+  devtools/kobo key fwd|back|power [N]    page-forward / page-back / power button, N presses
+  devtools/kobo put FILE [REMOTE_DIR]     copy a file to the Kobo (default /mnt/onboard/books), verified
+  devtools/kobo sh 'command'              run a shell command on the Kobo
+  devtools/kobo log [kanki|koreader] [N]  tail a log (default: kanki.log, 40 lines)
+  devtools/kobo info                      device, firmware, battery, uptime, Anki server state
+  devtools/kobo ping                      is the SSH server reachable?
+
+Environment: KOBO_HOST (default 192.168.1.177), KOBO_PORT (2222).
+
+Device facts (Libra Colour, codename monza; from /proc/bus/input/devices and KOReader's
+frontend/device/kobo/device.lua):
+  * screen 1264x1680 portrait, framebuffer 32 bpp BGRA, stride 5056
+  * /dev/input/event1 "Elan Touchscreen", multitouch protocol B. KOReader maps raw -> screen with
+    "switch axes and mirror Y": screen_x = raw_y, screen_y = 1679 - raw_x. We invert that.
+  * /dev/input/event0 "gpio-keys": 193 = page back, 194 = page forward (35 = sleep cover)
+  * /dev/input/event3 "bd71828-pwrkey": 116 = power (suspends: Wi-Fi and so SSH go away until woken)
+  * 32-bit kernel: struct input_event = { long sec, long usec, u16 type, u16 code, s32 value } = 16 bytes
+
+Gotchas seen on the device:
+  * Injected taps are delivered exactly once (verified by reading event1 back), but KOReader's touch
+    menu can close on a tap AND let the same tap reach whatever is underneath (tapping the menu's "^"
+    over the book list opened a book). Close menus by tapping a neutral spot, not over list items.
+  * In the reader, the top-centre opens the menu; most of the rest of the page turns pages.
+  * The Kobo sleeps after inactivity, and Wi-Fi (so SSH) goes with it. KOReader's
+    Tools > More tools > Keep alive prevents that while testing.
+"""
+
+import gzip
+import os
+import struct
+import subprocess
+import sys
+import time
+import zlib
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HOST = os.environ.get("KOBO_HOST", "192.168.1.177")
+PORT = os.environ.get("KOBO_PORT", "2222")
+KEY = os.path.join(ROOT, ".dev", "kobo_ed25519")
+KNOWN_HOSTS = os.path.join(ROOT, ".dev", "known_hosts")
+SCREENS = os.path.join(ROOT, ".dev", "screens")
+
+W, H, STRIDE = 1264, 1680, 5056
+TOUCH, KEYS, POWER = "/dev/input/event1", "/dev/input/event0", "/dev/input/event3"
+EV_SYN, EV_KEY, EV_ABS = 0, 1, 3
+SYN_REPORT, BTN_TOUCH = 0, 330
+ABS_MT_SLOT, ABS_MT_POSITION_X, ABS_MT_POSITION_Y = 0x2F, 0x35, 0x36
+ABS_MT_TOOL_TYPE, ABS_MT_TRACKING_ID, ABS_MT_PRESSURE = 0x37, 0x39, 0x3A
+KEYCODES = {"back": (KEYS, 193), "fwd": (KEYS, 194), "power": (POWER, 116)}
+
+
+def ssh(command, stdin=None, capture=True, timeout=60):
+    args = ["ssh", "-i", KEY, "-p", PORT, "-o", "UserKnownHostsFile=" + KNOWN_HOSTS,
+            "-o", "StrictHostKeyChecking=accept-new", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+            "root@" + HOST, command]
+    r = subprocess.run(args, input=stdin, capture_output=capture, timeout=timeout)
+    if r.returncode != 0 and capture:
+        err = r.stderr.decode(errors="replace").strip()
+        if "timed out" in err or "No route" in err or "refused" in err:
+            sys.exit("Kobo not reachable over SSH (%s). Is it awake, on Wi-Fi, with KOReader's SSH server on?" % err)
+    return r
+
+
+# --- input events -----------------------------------------------------------------------------
+
+def ev(etype, code, value):
+    return struct.pack("<llHHi", 0, 0, etype, code, value)
+
+
+def printf_bytes(data):
+    """Escape bytes for busybox printf (octal escapes; no NULs in the command line)."""
+    return "".join("\\%03o" % b for b in data)
+
+
+def raw_from_screen(x, y):
+    if not (0 <= x < W and 0 <= y < H):
+        sys.exit("coordinates must be within 0..%d, 0..%d" % (W - 1, H - 1))
+    return H - 1 - y, x  # invert KOReader's switch-axes-and-mirror-Y
+
+
+TRACKING_ID = int(time.time()) % 30000 + 1000
+
+
+def touch_down(x, y):
+    rx, ry = raw_from_screen(x, y)
+    return (ev(EV_ABS, ABS_MT_SLOT, 0) + ev(EV_ABS, ABS_MT_TRACKING_ID, TRACKING_ID)
+            + ev(EV_ABS, ABS_MT_TOOL_TYPE, 0) + ev(EV_ABS, ABS_MT_POSITION_X, rx)
+            + ev(EV_ABS, ABS_MT_POSITION_Y, ry) + ev(EV_ABS, ABS_MT_PRESSURE, 40)
+            + ev(EV_KEY, BTN_TOUCH, 1) + ev(EV_SYN, SYN_REPORT, 0))
+
+
+def touch_move(x, y):
+    rx, ry = raw_from_screen(x, y)
+    return ev(EV_ABS, ABS_MT_POSITION_X, rx) + ev(EV_ABS, ABS_MT_POSITION_Y, ry) + ev(EV_SYN, SYN_REPORT, 0)
+
+
+def touch_up():
+    return (ev(EV_ABS, ABS_MT_PRESSURE, 0) + ev(EV_ABS, ABS_MT_TRACKING_ID, -1)
+            + ev(EV_KEY, BTN_TOUCH, 0) + ev(EV_SYN, SYN_REPORT, 0))
+
+
+def run_steps(device, steps):
+    """steps: list of (bytes, sleep_after_seconds). Runs as one shell script on the Kobo so timing
+    doesn't depend on the network."""
+    lines = []
+    for data, pause in steps:
+        lines.append("printf '%s' > %s" % (printf_bytes(data), device))
+        if pause > 0:
+            lines.append("usleep %d" % int(pause * 1_000_000))
+    r = ssh(" ; ".join(lines))
+    if r.returncode != 0:
+        sys.exit(r.stderr.decode(errors="replace"))
+
+
+def tap(x, y):
+    run_steps(TOUCH, [(touch_down(x, y), 0.08), (touch_up(), 0)])
+
+
+def hold(x, y, secs=1.0):
+    run_steps(TOUCH, [(touch_down(x, y), secs), (touch_up(), 0)])
+
+
+def swipe(x1, y1, x2, y2, ms=300):
+    n = max(4, ms // 30)
+    steps = [(touch_down(x1, y1), ms / 1000 / n)]
+    for i in range(1, n + 1):
+        steps.append((touch_move(x1 + (x2 - x1) * i // n, y1 + (y2 - y1) * i // n), ms / 1000 / n))
+    steps.append((touch_up(), 0))
+    run_steps(TOUCH, steps)
+
+
+def key(name, presses=1):
+    device, code = KEYCODES[name]
+    steps = []
+    for _ in range(presses):
+        steps += [(ev(EV_KEY, code, 1) + ev(EV_SYN, SYN_REPORT, 0), 0.08),
+                  (ev(EV_KEY, code, 0) + ev(EV_SYN, SYN_REPORT, 0), 0.35)]
+    run_steps(device, steps)
+
+
+# --- screenshots ---------------------------------------------------------------------------------
+
+def png(width, height, rgb_rows):
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
+    raw = b"".join(b"\x00" + r for r in rgb_rows)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
+
+
+def shot(out=None, full=False):
+    r = ssh("dd if=/dev/fb0 bs=%d count=%d 2>/dev/null | gzip -1" % (STRIDE, H), timeout=90)
+    if r.returncode != 0 or not r.stdout:
+        sys.exit("screenshot failed: " + r.stderr.decode(errors="replace"))
+    data = gzip.decompress(r.stdout)
+    rows = []
+    for y in range(H):
+        row = data[y * STRIDE:y * STRIDE + W * 4]
+        px = bytearray(W * 3)
+        px[0::3], px[1::3], px[2::3] = row[2::4], row[1::4], row[0::4]  # BGRA -> RGB
+        rows.append(bytes(px))
+    os.makedirs(SCREENS, exist_ok=True)
+    out = out or os.path.join(SCREENS, time.strftime("%Y%m%d-%H%M%S") + ".png")
+    with open(out, "wb") as f:
+        f.write(png(W, H, rows))
+    print(out)
+    if not full:
+        small = out[:-4] + "-small.png"
+        subprocess.run(["sips", "-Z", "900", out, "--out", small], capture_output=True)
+        print(small)
+
+
+# --- file copy -----------------------------------------------------------------------------------
+
+def put(local, remote_dir="/mnt/onboard/books"):
+    """Copy one file to the Kobo, verified. Dropbear has no SFTP, so `scp` uploads fail: the bytes are
+    piped through `ssh 'cat > NAME.part'`, size and md5 are compared, and only then is the .part
+    renamed (never over an existing file) and synced. Names are sent in NFC form (FAT32 keeps them
+    as given; busybox `ls` prints multibyte characters such as ’ as '?', the stored name is fine)."""
+    import hashlib
+    import unicodedata
+    if not os.path.isfile(local):
+        sys.exit("no such file: %s" % local)
+    name = unicodedata.normalize("NFC", os.path.basename(local))
+    for bad in ('"', "$", "`", "\\", "\n"):
+        if bad in name or bad in remote_dir:
+            sys.exit("refusing a name containing %r (shell quoting)" % bad)
+    final = remote_dir.rstrip("/") + "/" + name
+    part = final + ".part"
+    size = os.path.getsize(local)
+    md5 = hashlib.md5(open(local, "rb").read()).hexdigest()
+    print("local : %s (%d bytes, md5 %s)" % (name, size, md5))
+
+    r = ssh('mkdir -p "%s" && [ ! -e "%s" ] && rm -f "%s" && echo FREE' % (remote_dir, final, part))
+    if b"FREE" not in r.stdout:
+        sys.exit("not copied: %s already exists on the Kobo (or the folder can't be created)" % final)
+    t0 = time.time()
+    with open(local, "rb") as f:
+        r = ssh('cat > "%s"' % part, stdin=f.read(), timeout=max(120, size // 200_000))
+    if r.returncode != 0:
+        ssh('rm -f "%s"' % part)
+        sys.exit("upload failed: " + r.stderr.decode(errors="replace"))
+    secs = time.time() - t0
+    r = ssh('wc -c < "%s"; md5sum "%s"' % (part, part))
+    lines = r.stdout.decode(errors="replace").split()
+    remote_size, remote_md5 = (int(lines[0]), lines[1]) if len(lines) >= 2 else (-1, "")
+    if (remote_size, remote_md5) != (size, md5):
+        ssh('rm -f "%s"' % part)
+        sys.exit("verification failed (remote %s bytes, md5 %s); nothing left on the Kobo" % (remote_size, remote_md5))
+    r = ssh('[ ! -e "%s" ] && mv "%s" "%s" && sync && echo OK' % (final, part, final))
+    if b"OK" not in r.stdout:
+        ssh('rm -f "%s"' % part)
+        sys.exit("rename failed: " + r.stderr.decode(errors="replace"))
+    print("kobo  : %s (verified, %.1f s, %.2f MB/s)" % (final, secs, size / 1e6 / max(secs, 0.01)))
+
+
+# --- misc ----------------------------------------------------------------------------------------
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    cmd, a = argv[0], argv[1:]
+    if cmd == "shot":
+        full = "--full" in a
+        a = [x for x in a if x != "--full"]
+        shot(a[0] if a else None, full)
+    elif cmd == "tap":
+        tap(int(a[0]), int(a[1]))
+    elif cmd == "hold":
+        hold(int(a[0]), int(a[1]), float(a[2]) if len(a) > 2 else 1.0)
+    elif cmd == "swipe":
+        swipe(int(a[0]), int(a[1]), int(a[2]), int(a[3]), int(a[4]) if len(a) > 4 else 300)
+    elif cmd == "key":
+        key(a[0], int(a[1]) if len(a) > 1 else 1)
+    elif cmd == "put":
+        put(a[0], a[1] if len(a) > 1 else "/mnt/onboard/books")
+    elif cmd == "sh":
+        r = ssh(" ".join(a), capture=False)
+        sys.exit(r.returncode)
+    elif cmd == "log":
+        which = a[0] if a else "kanki"
+        n = int(a[1]) if len(a) > 1 else 40
+        path = {"kanki": "/mnt/onboard/.adds/kanki/kanki.log",
+                "koreader": "/mnt/onboard/.adds/koreader/crash.log"}[which]
+        ssh("tail -n %d %s" % (n, path), capture=False)
+    elif cmd == "info":
+        ssh("cat /mnt/onboard/.kobo/version; echo; uptime; "
+            "echo battery: $(cat /sys/class/power_supply/*/capacity 2>/dev/null | head -1)%; "
+            "pidof kanki >/dev/null && echo 'Anki server: running' || echo 'Anki server: not running'; "
+            "pidof luajit >/dev/null && echo 'KOReader: running' || echo 'KOReader: not running'",
+            capture=False)
+    elif cmd == "ping":
+        r = ssh("echo ok")
+        print("reachable" if r.returncode == 0 else "not reachable")
+    else:
+        sys.exit("unknown command %r (see devtools/kobo --help)" % cmd)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
